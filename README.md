@@ -1,0 +1,1 @@
+Playing around with libdrm. I'm trying to display video at a specific resolution, as well as static images
