@@ -1,29 +1,23 @@
-#include <iostream>
-#include <array>
-#include <stdint.h>
-#include <fcntl.h>
-#include <string.h>
-#include <poll.h>
-#include <random>
 #include <thread>
 #include <chrono>
 #include <fstream>
+#include <csignal>
 #include "drm_output.hpp"
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <linux/kd.h>
+#include "images.hpp"
+#include "libbmp.h"
 
-std::random_device rdev;
-std::mt19937 rng(rdev());
+volatile std::sig_atomic_t isRunning = 1;
 
-uint32_t get_random_uint32()
+extern "C" void signal_handler(int)
 {
-	std::uniform_int_distribution dist(0U, std::numeric_limits<uint32_t>::max());
-	return dist(rng);
+	isRunning = 0;
 }
 
 int main(int argc, char** argv)
 {
+	signal(SIGTERM, signal_handler);
+	signal(SIGINT, signal_handler);
+
 	//получить карты
 	std::vector<std::filesystem::path> cards_paths = getCardPaths();
 
@@ -56,7 +50,7 @@ int main(int argc, char** argv)
 		return -1;
 	}
 
-	//сохранение текущего состояния и переклчение режима
+	//сохранение текущего состояния и переключение режима
 	TTYguard guard;
 
 	//настройка drm
@@ -73,23 +67,70 @@ int main(int argc, char** argv)
 
 	//фпс
 	constexpr unsigned int video_fps = 30;
-	uint32_t monitor_fps = getMonitorFrequency(connected_plane->getFD(), connected_plane->getCRTCID());
 
 	//видео
 	std::ifstream video("../video/yamero.raw", std::ios::binary);
+	std::array<uint8_t, FRAMEBUF_SIZE> raw_frame;
+	std::array<uint32_t, FRAMEBUF_SIZE> frame;
 
-	bool success = false;
-	try
+	//картинка
+	BmpImg img;
+	img.read("../image/clear.bmp");
+	std::array<uint32_t, FRAMEBUF_SIZE> image;
+
+	for(int i = 0; i < FRAMEBUF_SIZE; ++i)
 	{
-		success = framebuf->playVideo(video, video_fps, monitor_fps);
+		image[i] = static_cast<uint32_t>(img.green_at(i % WIDTH, i / WIDTH) * 0x00010101u);
 	}
-	catch(const std::exception& e)
+
+	bool showVideo = true;
+	while(isRunning)
 	{
-		std::cerr << e.what() << '\n';
+		if(showVideo)
+		{
+			if(!readFrame(video, raw_frame))
+			{
+				showVideo = false;
+				continue;
+			}
+			processRawFrame(raw_frame, frame);
+
+			try
+			{
+				framebuf->playVideo(frame, video_fps);
+			}
+			catch(const std::exception& e)
+			{
+				std::cerr << e.what() << '\n';
+				isRunning = false;
+			}
+		}
+		else
+		{
+			try
+			{
+				framebuf->showImage(image, std::chrono::seconds{3});
+			}
+			catch(const std::exception& e)
+			{
+				std::cerr << e.what() << '\n';
+				isRunning = false;
+			}
+
+			showVideo = true;
+			video.clear();
+			video.seekg(0, std::ios::beg);
+			framebuf->resetCounter();
+
+			if (!video)
+			{
+				std::cerr << "rewind failed\n";
+				isRunning = false;
+			}
+		}
 	}
 	
-	success ? std::cout << "Video ended\n" : std::cerr << "Video play failed\n";
-	
+	video.close();
 	framebuf.release();
 	return 0;
 }

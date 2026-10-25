@@ -19,15 +19,17 @@
 #include <linux/kd.h>
 #include <poll.h>
 #include <string.h>
+#include <cstring>
 #include <iostream>
+#include <thread>
 
 constexpr unsigned short WIDTH = 256;
 constexpr unsigned short HEIGHT = 64;
 constexpr unsigned short FRAMEBUF_SIZE = WIDTH * HEIGHT;
 
 std::vector<std::filesystem::path> getCardPaths();
-uint32_t getMonitorFrequency(int fd, uint32_t crtc_id);
 bool readFrame(std::ifstream& video, std::array<uint8_t, FRAMEBUF_SIZE>& frame);
+void processRawFrame(const std::array<uint8_t, FRAMEBUF_SIZE>& src, std::array<uint32_t, FRAMEBUF_SIZE>& dst);
 
 class ConnectedPlaneFDException : public std::runtime_error
 {
@@ -46,7 +48,7 @@ public:
     uint32_t getPrimaryPlaneID();
     uint32_t getCRTCID();
     uint32_t getProperty(std::string_view);
-    const drmModeAtomicReqPtr getReq();
+    drmModeAtomicReqPtr getReq();
     void setProperty(uint32_t, uint64_t);
 private:
     int fd = -1;
@@ -97,10 +99,13 @@ public:
     MappedMemory& getBuffer1();
     MappedMemory& getBuffer2();
 
-    bool playVideo(std::ifstream&, uint32_t src_fps, uint32_t dst_fps);
+    void playVideo(const std::array<uint32_t, FRAMEBUF_SIZE>& frame, uint32_t src_fps);
+    void showImage(const std::array<uint32_t, FRAMEBUF_SIZE>& image, std::chrono::seconds delay_sec);
+    void resetCounter();
 
 private:
     uint32_t fb1_id, fb2_id;
+    uint32_t front, back;
     uint32_t prop_fb_id;
     uint32_t handles1[4] = {0};
     uint32_t handles2[4] = {0};
@@ -110,11 +115,12 @@ private:
     uint32_t offsets2[4] = {0};
     MappedMemory buf1, buf2;
     int fd = 0;
+    bool sequence_done = false;
     uint32_t crtc_id = 0;
     uint32_t primary_plane_id = 0;
-
-    std::array<uint8_t, FRAMEBUF_SIZE> raw_frame;
-	std::array<uint32_t, FRAMEBUF_SIZE> frame;
+    uint32_t monitor_fps = 0;
+    uint64_t counter = 0;
+    drmEventContext ev;
 };
 
 class TTYguard

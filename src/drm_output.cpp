@@ -7,10 +7,12 @@ bool readFrame(std::ifstream& video, std::array<uint8_t, FRAMEBUF_SIZE>& frame)
 	return video.gcount() == FRAMEBUF_SIZE;
 }
 
-uint32_t getMonitorFrequency(int fd, uint32_t crtc_id)
+void processRawFrame(const std::array<uint8_t, FRAMEBUF_SIZE>& src, std::array<uint32_t, FRAMEBUF_SIZE>& dst)
 {
-	std::unique_ptr<drmModeCrtc, decltype(&drmModeFreeCrtc)> crtc(drmModeGetCrtc(fd, crtc_id), drmModeFreeCrtc);
-	return crtc->mode.vrefresh;
+	for (size_t i = 0; i < FRAMEBUF_SIZE; ++i)
+	{	
+		dst[i] = static_cast<uint32_t>(src[i] * 0x00010101u);
+	}
 }
 
 std::vector<std::filesystem::path> getCardPaths()
@@ -175,7 +177,7 @@ uint32_t ConnectedPlaneFD::getProperty(std::string_view prop)
 	throw std::runtime_error("getPropertyID: no such property" + std::string{prop.data()});
 }
 
-const drmModeAtomicReqPtr ConnectedPlaneFD::getReq()
+drmModeAtomicReqPtr ConnectedPlaneFD::getReq()
 {
 	return req.get();
 }
@@ -316,6 +318,22 @@ DoubleFramebuffer::DoubleFramebuffer(ConnectedPlaneFD& plane) : buf1(plane.getFD
 		drmModeRmFB(fd, fb2_id);
 		throw std::system_error(-ret, std::generic_category(), "drmModeAtomicCommit failed");
 	}
+
+	std::unique_ptr<drmModeCrtc, decltype(&drmModeFreeCrtc)> crtc(drmModeGetCrtc(fd, crtc_id), drmModeFreeCrtc);
+	monitor_fps = crtc->mode.vrefresh;
+
+	ev.version = DRM_EVENT_CONTEXT_VERSION;
+	ev.page_flip_handler = [](int fd, unsigned int sequnce, unsigned int tv_sec, unsigned int tv_usec, void* user_data)
+	{
+		*(reinterpret_cast<bool*>(user_data)) = true;
+	};
+	ev.sequence_handler = [](int fd, uint64_t, uint64_t, uint64_t user_data)
+	{
+		*(reinterpret_cast<bool*>(user_data)) = true;
+	};
+
+	front = fb1_id;
+	back = fb2_id;
 }
 
 DoubleFramebuffer::~DoubleFramebuffer()
@@ -349,109 +367,124 @@ MappedMemory& DoubleFramebuffer::getBuffer2()
 	return buf2;
 }
 
-//ну что это блин
-bool DoubleFramebuffer::playVideo(std::ifstream& file, uint32_t src_fps, uint32_t dst_fps)
+void DoubleFramebuffer::playVideo(const std::array<uint32_t, FRAMEBUF_SIZE>& frame, uint32_t src_fps)
 {
 	bool flip_done = false;
-	drmEventContext ev{};
-	ev.version = DRM_EVENT_CONTEXT_VERSION;
+	sequence_done = false;
+	
+	if(src_fps > monitor_fps)
+		throw std::runtime_error("src_framerate is higher than monitor framerate");
+	uint64_t queued_sequence = 0;
+	counter += monitor_fps;
+	uint64_t vblanks = counter / src_fps;
+	counter %= src_fps;
 
-	ev.page_flip_handler = [](int fd, unsigned int sequnce, unsigned int tv_sec, unsigned int tv_usec, void* user_data)
+	int ret = drmCrtcQueueSequence(fd, crtc_id, DRM_CRTC_SEQUENCE_RELATIVE, vblanks - 1 , &queued_sequence, reinterpret_cast<uint64_t>(&sequence_done));
+	if(ret < 0)
+		throw std::runtime_error("sequence failed");
+	
+	while(!sequence_done)
 	{
-		*(reinterpret_cast<bool*>(user_data)) = true;
-	};
+		pollfd pfd{fd, POLLIN, 0};
 
-	ev.sequence_handler = [](int fd, uint64_t, uint64_t, uint64_t user_data)
-	{
-		*(reinterpret_cast<bool*>(user_data)) = true;
-	};
-
-	uint32_t front = fb1_id;
-	uint32_t back = fb2_id;
-
-	bool isPlaying = true;
-	uint64_t counter = 0;
-	// основной цикл
-	while(isPlaying)
-	{
-		bool sequence_done = false;
-		uint64_t queued_sequence = 0;
-		
-		counter += dst_fps;
-		uint64_t vblanks = counter / src_fps;
-		counter %= src_fps;
-
-		int ret = drmCrtcQueueSequence(fd, crtc_id, DRM_CRTC_SEQUENCE_RELATIVE, vblanks - 1 , &queued_sequence, reinterpret_cast<uint64_t>(&sequence_done));
-		if(ret < 0)
-			throw std::runtime_error("seqence failed");
-		
-		if(!readFrame(file, raw_frame))
-			isPlaying = false;
-		
-		void* back_ptr = (back == fb1_id) ? buf1.data() : buf2.data();
-		uint32_t back_pitch = (back == fb1_id) ? buf1.getBufferPitch() : buf2.getBufferPitch();
-		
-		for (size_t y = 0; y < HEIGHT; ++y)
+		if(poll(&pfd, 1, -1) < 0)
 		{
-			auto* dst = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(back_ptr) + y * back_pitch);
-		
-			for (size_t x = 0; x < WIDTH; ++x)
-			{
-				uint32_t gray = raw_frame[y * WIDTH + x];
-				dst[x] = gray * 0x00010101u;
-			}
+			if (errno == EINTR)
+				continue;
+	
+			throw std::system_error(errno, std::generic_category(), "poll failed");
 		}
+		if(pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+			throw std::runtime_error("DRM poll error");
 
-		while(!sequence_done)
-		{
-			pollfd pfd{fd, POLLIN, 0};
+		if((pfd.revents & POLLIN) && drmHandleEvent(fd, &ev))
+			throw std::runtime_error("drmHandleEvent failed");
+	}	
 
-			if(poll(&pfd, 1, -1) < 0)
-			{
-				if(errno == EINTR)
-					continue;
-
-				throw std::runtime_error("poll failed");
-			}
-			if(pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
-				throw std::runtime_error("DRM poll error");
-
-			if((pfd.revents & POLLIN) && drmHandleEvent(fd, &ev))
-				throw std::runtime_error("drmHandleEvent failed");
-		}	
-
-		std::unique_ptr<drmModeAtomicReq, decltype(&drmModeAtomicFree)> req{drmModeAtomicAlloc(), drmModeAtomicFree};
-
-		if(drmModeAtomicAddProperty(req.get(), primary_plane_id, prop_fb_id, back) < 0)
-			throw std::runtime_error("failed to add buffer");
-
-		flip_done = false;
-
-		if(drmModeAtomicCommit(fd, req.get(), DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT, &flip_done) != 0)
-			throw std::runtime_error("atomic flip failed");
-
-		while(!flip_done)
-		{
-			pollfd pfd{fd, POLLIN, 0};
-
-			if(poll(&pfd, 1, -1) < 0)
-			{
-				if(errno == EINTR)
-					continue;
-
-				throw std::runtime_error("poll failed");
-			}
-			if(pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
-				throw std::runtime_error("DRM poll error");
-
-			if((pfd.revents & POLLIN) && drmHandleEvent(fd, &ev))
-				throw std::runtime_error("drmHandleEvent failed");
-		}
-
-		std::swap(front, back);
+	void* back_ptr = (back == fb1_id) ? buf1.data() : buf2.data();
+	uint32_t back_pitch = (back == fb1_id) ? buf1.getBufferPitch() : buf2.getBufferPitch();
+	std::byte* dst = static_cast<std::byte*>(back_ptr);
+	for (uint32_t y = 0; y < HEIGHT; ++y)
+	{
+		std::memcpy(dst + y * back_pitch, frame.data() + y * WIDTH, WIDTH * sizeof(uint32_t));
 	}
 
-	return true;
+	std::unique_ptr<drmModeAtomicReq, decltype(&drmModeAtomicFree)> req{drmModeAtomicAlloc(), drmModeAtomicFree};
+	if(req == nullptr)
+		throw std::runtime_error("drmModeAtomicReq failed");
+
+	if(drmModeAtomicAddProperty(req.get(), primary_plane_id, prop_fb_id, back) < 0)
+		throw std::runtime_error("failed to add buffer");
+	if(drmModeAtomicCommit(fd, req.get(), DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT, &flip_done) != 0)
+		throw std::runtime_error("atomic flip failed");
+
+	while(!flip_done)
+	{
+		pollfd pfd{fd, POLLIN, 0};
+
+		if(poll(&pfd, 1, -1) < 0)
+		{
+			if (errno == EINTR)
+				continue;
+	
+			throw std::system_error(errno, std::generic_category(), "poll failed");
+		}
+		if(pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+			throw std::runtime_error("DRM poll error");
+
+		if((pfd.revents & POLLIN) && drmHandleEvent(fd, &ev))
+			throw std::runtime_error("drmHandleEvent failed");
+	}
+
+	std::swap(front, back);
+}
+
+void DoubleFramebuffer::showImage(const std::array<uint32_t, FRAMEBUF_SIZE>& image, std::chrono::seconds delay_sec)
+{
+	bool flip_done = false;
+
+	void* back_ptr = (back == fb1_id) ? buf1.data() : buf2.data();
+	uint32_t back_pitch = (back == fb1_id) ? buf1.getBufferPitch() : buf2.getBufferPitch();
+	std::byte* dst = static_cast<std::byte*>(back_ptr);
+	for (uint32_t y = 0; y < HEIGHT; ++y)
+	{
+		std::memcpy(dst + y * back_pitch, image.data() + y * WIDTH, WIDTH * sizeof(uint32_t));
+	}
+
+	std::unique_ptr<drmModeAtomicReq, decltype(&drmModeAtomicFree)> req{drmModeAtomicAlloc(), drmModeAtomicFree};
+	if(req == nullptr)
+		throw std::runtime_error("drmModeAtomicReq failed");
+
+	if(drmModeAtomicAddProperty(req.get(), primary_plane_id, prop_fb_id, back) < 0)
+		throw std::runtime_error("failed to add buffer");
+	if(drmModeAtomicCommit(fd, req.get(), DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT, &flip_done) != 0)
+		throw std::runtime_error("atomic flip failed");
+
+	while(!flip_done)
+	{
+		pollfd pfd{fd, POLLIN, 0};
+
+		if(poll(&pfd, 1, -1) < 0)
+		{
+			if (errno == EINTR)
+				continue;
+	
+			throw std::system_error(errno, std::generic_category(), "poll failed");
+		}
+		if(pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+			throw std::runtime_error("DRM poll error");
+
+		if((pfd.revents & POLLIN) && drmHandleEvent(fd, &ev))
+			throw std::runtime_error("drmHandleEvent failed");
+	}
+	std::swap(front, back);
+
+	std::this_thread::sleep_for(std::chrono::duration{delay_sec});
+}
+
+void DoubleFramebuffer::resetCounter()
+{
+	counter = 0;
 }
 
 TTYguard::TTYguard()
